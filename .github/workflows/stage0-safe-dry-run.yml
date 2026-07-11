@@ -1,0 +1,255 @@
+name: Stage 0 Safe Data Dry Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      stocks:
+        description: "One to three six-digit stock codes, comma separated"
+        required: true
+        default: "605567"
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: stage0-safe-dry-run-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  safe-data-dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      REVIEW_BASELINE_SHA: d08374898c25f4718d61b1779ac4c1fedc9aa9a2
+      BRANCH_PARENT_SHA: d08374898c25f4718d61b1779ac4c1fedc9aa9a2
+      ARTIFACT_NAME: stage0-safe-dry-run-evidence
+    steps:
+      # Provenance: actions/checkout v4.2.2
+      # Full SHA: 11bd71901bbe5b1630ceea73d27597364c9af683
+      # Source: https://github.com/actions/checkout/commit/11bd71901bbe5b1630ceea73d27597364c9af683
+      # Verified: 2026-07-11
+      - name: Checkout without persisted credentials
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+
+      # Provenance: actions/setup-python audited v5 commit
+      # Full SHA: 42375524e23c412d93fb67b49958b491fce71c38
+      # Source: https://github.com/actions/setup-python/commit/42375524e23c412d93fb67b49958b491fce71c38
+      # Verified: 2026-07-11
+      - name: Set up Python 3.11
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Validate stock input
+        id: validate
+        shell: bash
+        env:
+          STOCKS_INPUT: ${{ inputs.stocks }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$STOCKS_INPUT" =~ ^[0-9]{6}(,[0-9]{6}){0,2}$ ]]; then
+            echo "Invalid stocks input; expected ^[0-9]{6}(,[0-9]{6}){0,2}$" >&2
+            exit 2
+          fi
+          printf 'stocks=%s\n' "$STOCKS_INPUT" >> "$GITHUB_OUTPUT"
+
+      - name: Install existing locked requirements
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Run fixed safe dry-run command
+        id: application
+        shell: bash
+        env:
+          VALIDATED_STOCKS: ${{ steps.validate.outputs.stocks }}
+        run: |
+          set +e
+          started_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          start_epoch="$(date +%s)"
+          python main.py --dry-run --no-notify --no-market-review --force-run --stocks "$VALIDATED_STOCKS" 2>&1 | tee application.log
+          application_exit_code=${PIPESTATUS[0]}
+          end_epoch="$(date +%s)"
+          finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          duration_seconds=$((end_epoch - start_epoch))
+          {
+            printf 'application_exit_code=%s\n' "$application_exit_code"
+            printf 'started_at=%s\n' "$started_at"
+            printf 'finished_at=%s\n' "$finished_at"
+            printf 'duration_seconds=%s\n' "$duration_seconds"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Verify per-code data events
+        id: verify
+        shell: bash
+        env:
+          VALIDATED_STOCKS: ${{ steps.validate.outputs.stocks }}
+          APPLICATION_EXIT_CODE: ${{ steps.application.outputs.application_exit_code }}
+        run: |
+          set +e
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          text = Path("application.log").read_text(encoding="utf-8", errors="replace")
+          codes = os.environ["VALIDATED_STOCKS"].split(",")
+          success_words = re.compile(r"(成功|完成|success|completed|fetched|dry.?run)", re.I)
+          failure_words = re.compile(r"(失败|错误|exception|traceback|failed|error|timeout)", re.I)
+          events = []
+          verification_exit_code = 0
+          for code in codes:
+              lines = [line for line in text.splitlines() if code in line]
+              success = any(success_words.search(line) and not failure_words.search(line) for line in lines)
+              failure = any(failure_words.search(line) for line in lines)
+              status = "success" if success and not failure else "failure"
+              events.append({
+                  "stock_code": code,
+                  "status": status,
+                  "success_event_observed": success,
+                  "failure_event_observed": failure,
+              })
+              if status != "success":
+                  verification_exit_code = 1
+          if int(os.environ["APPLICATION_EXIT_CODE"]) != 0:
+              verification_exit_code = 1
+          Path("stock-events.json").write_text(
+              json.dumps(events, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          Path("verification-exit-code.txt").write_text(
+              str(verification_exit_code) + "\n", encoding="utf-8"
+          )
+          PY
+          verification_exit_code="$(cat verification-exit-code.txt)"
+          if [[ "$APPLICATION_EXIT_CODE" == "0" && "$verification_exit_code" == "0" ]]; then
+            expected_job_conclusion=success
+          else
+            expected_job_conclusion=failure
+          fi
+          {
+            printf 'verification_exit_code=%s\n' "$verification_exit_code"
+            printf 'expected_job_conclusion=%s\n' "$expected_job_conclusion"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Build evidence manifest
+        if: always()
+        shell: bash
+        env:
+          VALIDATED_STOCKS: ${{ steps.validate.outputs.stocks }}
+          APPLICATION_EXIT_CODE: ${{ steps.application.outputs.application_exit_code }}
+          VERIFICATION_EXIT_CODE: ${{ steps.verify.outputs.verification_exit_code }}
+          EXPECTED_JOB_CONCLUSION: ${{ steps.verify.outputs.expected_job_conclusion }}
+          STARTED_AT: ${{ steps.application.outputs.started_at }}
+          FINISHED_AT: ${{ steps.application.outputs.finished_at }}
+          DURATION_SECONDS: ${{ steps.application.outputs.duration_seconds }}
+          RUN_COMMIT_SHA: ${{ github.sha }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_REF: ${{ github.ref }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          def value(name, fallback="unavailable"):
+              return os.environ.get(name) or fallback
+
+          log = Path("application.log").read_text(encoding="utf-8", errors="replace") if Path("application.log").exists() else ""
+          known_sources = sorted(set(re.findall(
+              r"(?i)\b(akshare|tushare|tencent|eastmoney|sina|baostock|yfinance)\b",
+              log,
+          )))
+          events = json.loads(Path("stock-events.json").read_text(encoding="utf-8")) if Path("stock-events.json").exists() else []
+          manifest = {
+              "run": {
+                  "repository": os.environ["GITHUB_REPOSITORY"],
+                  "workflow_path": ".github/workflows/stage0-safe-dry-run.yml",
+                  "run_id": value("RUN_ID"),
+                  "attempt": value("RUN_ATTEMPT"),
+                  "ref": value("RUN_REF"),
+                  "review_baseline_sha": os.environ["REVIEW_BASELINE_SHA"],
+                  "branch_parent_sha": os.environ["BRANCH_PARENT_SHA"],
+                  "run_commit_sha": value("RUN_COMMIT_SHA"),
+                  "started_at": value("STARTED_AT"),
+                  "finished_at": value("FINISHED_AT"),
+                  "duration_seconds": value("DURATION_SECONDS"),
+                  "stocks": value("VALIDATED_STOCKS"),
+                  "application_exit_code": value("APPLICATION_EXIT_CODE"),
+                  "verification_exit_code": value("VERIFICATION_EXIT_CODE"),
+                  "expected_job_conclusion": value("EXPECTED_JOB_CONCLUSION"),
+                  "actual_job_conclusion": "not_available_inside_running_job",
+              },
+              "requested_guards": {
+                  "dry_run": True,
+                  "no_notify": True,
+                  "no_market_review": True,
+                  "force_run": True,
+                  "llm_expected_disabled": True,
+                  "secrets_referenced_by_workflow": False,
+              },
+              "source_guard_evidence": {
+                  "command": ["python", "main.py", "--dry-run", "--no-notify", "--no-market-review", "--force-run", "--stocks", value("VALIDATED_STOCKS")],
+                  "workflow_permissions": {},
+                  "checkout_persist_credentials": False,
+                  "stock_input_pattern": "^[0-9]{6}(,[0-9]{6}){0,2}$",
+              },
+              "runtime_observations": {
+                  "stock_events": events,
+                  "data_sources_observed_in_log": known_sources,
+                  "llm_or_provider_call_observed": bool(re.search(r"(?i)(openai|anthropic|gemini|llm request)", log)),
+                  "notification_sender_observed": bool(re.search(r"(?i)(webhook|telegram|discord|send.*notification|发送.*通知)", log)),
+              },
+              "proof_limit": [
+                  "requested guards and source constants do not prove an execution path was not reached",
+                  "log observations do not prove absence of all network traffic",
+                  "this probe does not prove the production 00-daily-analysis.yml path",
+                  "expected_job_conclusion is predicted inside the job and is not GitHub API actual_job_conclusion",
+                  "a passing run does not prove persistence, licensing, semantic correctness, investment value, or Stage 0 completion",
+              ],
+              "artifact_name": os.environ["ARTIFACT_NAME"],
+              "retention_days": 30,
+          }
+          Path("stage0-safe-dry-run-manifest.json").write_text(
+              json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      # Provenance: actions/upload-artifact v4.6.2
+      # Full SHA: ea165f8d65b6e75b540449e92b4886f43607fa02
+      # Source: https://github.com/actions/upload-artifact/commit/ea165f8d65b6e75b540449e92b4886f43607fa02
+      # Verified: 2026-07-11
+      - name: Upload diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: |
+            application.log
+            stock-events.json
+            stage0-safe-dry-run-manifest.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Restore truthful job conclusion
+        if: always()
+        shell: bash
+        env:
+          APPLICATION_EXIT_CODE: ${{ steps.application.outputs.application_exit_code }}
+          VERIFICATION_EXIT_CODE: ${{ steps.verify.outputs.verification_exit_code }}
+        run: |
+          app_code="${APPLICATION_EXIT_CODE:-1}"
+          verify_code="${VERIFICATION_EXIT_CODE:-1}"
+          if [[ "$app_code" != "0" || "$verify_code" != "0" ]]; then
+            printf 'Safe dry-run failed: application=%s verification=%s\n' "$app_code" "$verify_code" >&2
+            exit 1
+          fi
